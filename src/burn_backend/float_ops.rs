@@ -1919,6 +1919,13 @@ impl FloatTensorOps<Self> for NpuBurnBackend {
     }
 
     fn float_cat(tensors: Vec<FloatTensor<Self>>, dim: usize) -> FloatTensor<Self> {
+        #[cfg(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk))]
+        {
+            let refs: Vec<&NpuFloatTensor> = tensors.iter().collect();
+            if let Some(out) = crate::backends::qualcomm::try_concat(&refs, dim) {
+                return out;
+            }
+        }
         let nd_tensors: Vec<_> = tensors.iter().map(npu_to_ndarray).collect();
         let result = <Fx as FloatTensorOps<Fx>>::float_cat(nd_tensors, dim);
         ndarray_to_npu(&result)

@@ -20,11 +20,15 @@ pub fn detect() -> Option<NpuInfo> {
         }
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         if let Some(info) = detect_qualcomm_linux() {
             return Some(info);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
         if let Some(info) = detect_intel_linux() {
             return Some(info);
         }
@@ -216,8 +220,35 @@ fn detect_intel_windows() -> Option<NpuInfo> {
 /// `/proc/cpuinfo` reports the Qualcomm implementer ID (0x51) as a fallback.
 /// Neither confirms that the QNN SDK is installed -- that is a build-time
 /// concern handled in `build.rs`.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn detect_qualcomm_qualifier() -> Option<String> {
+    // Android has no usable device-tree model and its `/proc/cpuinfo` is
+    // deliberately sparse, so ask the property service for the SoC name.
+    // Emulators report names like "ranchu"/"goldfish"; only accept values
+    // that actually identify a Qualcomm part.
+    #[cfg(target_os = "android")]
+    for key in [
+        "ro.soc.model",
+        "ro.board.platform",
+        "ro.hardware",
+        "ro.product.board",
+    ] {
+        if let Ok(output) = std::process::Command::new("getprop").arg(key).output() {
+            let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let lower = value.to_lowercase();
+            if lower.contains("qualcomm")
+                || lower.contains("snapdragon")
+                || lower.contains("qcom")
+                || lower.starts_with("sm")
+                || lower.starts_with("msm")
+                || lower.starts_with("qcm")
+                || lower.starts_with("qcs")
+            {
+                return Some(value);
+            }
+        }
+    }
+
     if let Ok(model) = std::fs::read_to_string("/proc/device-tree/model") {
         let model = model.trim_end_matches('\0').trim().to_string();
         if model.to_lowercase().contains("qualcomm") || model.to_lowercase().contains("snapdragon")
@@ -235,7 +266,7 @@ fn detect_qualcomm_qualifier() -> Option<String> {
     None
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "android"))]
 fn detect_qualcomm_linux() -> Option<NpuInfo> {
     let model = detect_qualcomm_qualifier()?;
     Some(NpuInfo {

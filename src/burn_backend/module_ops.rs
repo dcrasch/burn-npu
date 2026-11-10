@@ -520,6 +520,20 @@ impl ModuleOps<Self> for NpuBurnBackend {
         bias: Option<FloatTensor<Self>>,
         options: ConvOptions<2>,
     ) -> FloatTensor<Self> {
+        #[cfg(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk))]
+        {
+            if let Some(out) = crate::backends::qualcomm::try_conv2d(
+                &x,
+                &weight,
+                bias.as_ref(),
+                options.stride,
+                options.padding,
+                options.dilation,
+                options.groups,
+            ) {
+                return out;
+            }
+        }
         let nd_x = npu_to_ndarray(&x);
         let nd_w = npu_to_ndarray(&weight);
         let nd_b = bias.as_ref().map(npu_to_ndarray);
@@ -618,6 +632,21 @@ impl ModuleOps<Self> for NpuBurnBackend {
         count_include_pad: bool,
         ceil_mode: bool,
     ) -> FloatTensor<Self> {
+        #[cfg(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk))]
+        {
+            if !ceil_mode {
+                if let Some(out) = crate::backends::qualcomm::try_pool2d(
+                    &x,
+                    false,
+                    kernel_size,
+                    stride,
+                    padding,
+                    count_include_pad,
+                ) {
+                    return out;
+                }
+            }
+        }
         let nd_x = npu_to_ndarray(&x);
         let result = <Fx as ModuleOps<Fx>>::avg_pool2d(
             nd_x,
@@ -677,6 +706,21 @@ impl ModuleOps<Self> for NpuBurnBackend {
         dilation: [usize; 2],
         ceil_mode: bool,
     ) -> FloatTensor<Self> {
+        #[cfg(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk))]
+        {
+            if !ceil_mode && dilation == [1, 1] {
+                if let Some(out) = crate::backends::qualcomm::try_pool2d(
+                    &x,
+                    true,
+                    kernel_size,
+                    stride,
+                    padding,
+                    false,
+                ) {
+                    return out;
+                }
+            }
+        }
         let nd_x = npu_to_ndarray(&x);
         let result = <Fx as ModuleOps<Fx>>::max_pool2d(
             nd_x,

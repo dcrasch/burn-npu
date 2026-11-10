@@ -185,6 +185,28 @@ impl Backend for NpuBurnBackend {
 // ===========================================================================
 // ActivationOps (all methods have defaults)
 // ===========================================================================
+#[cfg(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk))]
+impl ActivationOps<Self> for NpuBurnBackend {
+    fn relu(tensor: FloatTensor<Self>) -> FloatTensor<Self> {
+        if let Some(out) = crate::backends::qualcomm::try_relu(&tensor) {
+            return out;
+        }
+        let nd = tensor::npu_to_ndarray(&tensor);
+        tensor::ndarray_to_npu(&<Fx as ActivationOps<Fx>>::relu(nd))
+    }
+
+    fn softmax(tensor: FloatTensor<Self>, dim: usize) -> FloatTensor<Self> {
+        if dim + 1 == tensor.shape.len() {
+            if let Some(out) = crate::backends::qualcomm::try_softmax(&tensor) {
+                return out;
+            }
+        }
+        let nd = tensor::npu_to_ndarray(&tensor);
+        tensor::ndarray_to_npu(&<Fx as ActivationOps<Fx>>::softmax(nd, dim))
+    }
+}
+
+#[cfg(not(all(feature = "qualcomm", not(feature = "intel"), qnn_sdk)))]
 impl ActivationOps<Self> for NpuBurnBackend {}
 
 // ===========================================================================

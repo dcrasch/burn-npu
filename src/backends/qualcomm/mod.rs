@@ -19,9 +19,104 @@
 //! [`qnn`] for what specifically still needs checking on a device.
 
 use burn_tensor::{DType, Shape};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(qnn_sdk)]
 pub mod qnn;
+
+/// One static parameter of a QNN op, using the names from `QnnOpDef.h`.
+pub enum OpParam {
+    /// Scalar `uint32` such as `group` or `axis`.
+    U32(&'static str, u32),
+    /// Scalar `float32` such as `beta`.
+    F32(&'static str, f32),
+    /// Scalar `bool8` such as `count_pad_for_edges`.
+    Bool(&'static str, bool),
+    /// `uint32` tensor parameter such as `stride` or `pad_amount`: dims, values.
+    U32Tensor(&'static str, Vec<u32>, Vec<u32>),
+}
+
+/// A tensor in a fused graph: its dims and, for weights, its data.
+pub struct FusedTensor {
+    pub dims: Vec<u32>,
+    /// `Some` for static weights and biases, `None` for the graph input and
+    /// all intermediates.
+    pub data: Option<Vec<f32>>,
+}
+
+/// One op in a fused graph. Tensors are indexes into [`FusedGraph::tensors`].
+pub struct FusedOp {
+    pub op_type: &'static str,
+    pub inputs: Vec<usize>,
+    pub output: usize,
+    pub params: Vec<OpParam>,
+}
+
+/// A whole network described as tensors plus ops, built into one QNN graph.
+pub struct FusedGraph {
+    pub tensors: Vec<FusedTensor>,
+    pub ops: Vec<FusedOp>,
+    pub input: usize,
+    pub output: usize,
+}
+
+/// Number of matmuls that have actually executed on the Hexagon NPU.
+///
+/// The CPU fallback is intentionally silent, so this is the only way for a
+/// caller to tell a QNN dispatch from a fallback.
+static NPU_DISPATCHES: AtomicU64 = AtomicU64::new(0);
+
+/// How many matmuls have run on the Hexagon NPU in this process.
+pub fn npu_dispatch_count() -> u64 {
+    NPU_DISPATCHES.load(Ordering::Relaxed)
+}
+
+/// Total time spent building QNN graphs in this process, in nanoseconds.
+///
+/// Graph building happens on the first call for each distinct op signature; it
+/// is zero once the graphs are cached.
+static NPU_BUILD_NANOS: AtomicU64 = AtomicU64::new(0);
+/// Total time spent executing QNN graphs in this process, in nanoseconds.
+static NPU_EXEC_NANOS: AtomicU64 = AtomicU64::new(0);
+
+/// Nanoseconds spent building QNN graphs so far.
+pub fn npu_build_nanos() -> u64 {
+    NPU_BUILD_NANOS.load(Ordering::Relaxed)
+}
+
+/// Nanoseconds spent executing QNN graphs so far.
+pub fn npu_exec_nanos() -> u64 {
+    NPU_EXEC_NANOS.load(Ordering::Relaxed)
+}
+
+#[cfg(qnn_sdk)]
+pub(crate) fn record_build_time(nanos: u64) {
+    NPU_BUILD_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+#[cfg(qnn_sdk)]
+pub(crate) fn record_exec_time(nanos: u64) {
+    NPU_EXEC_NANOS.fetch_add(nanos, Ordering::Relaxed);
+}
+
+/// When set, every op takes the CPU path even if the NPU is available. Used
+/// to benchmark CPU against NPU in one process.
+static FORCE_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Route all ops to the CPU (`true`) or allow the NPU again (`false`).
+pub fn set_force_cpu(force: bool) {
+    FORCE_CPU.store(force, Ordering::Relaxed);
+}
+
+/// Whether the NPU is currently allowed.
+pub fn npu_enabled() -> bool {
+    cfg!(qnn_sdk) && !FORCE_CPU.load(Ordering::Relaxed)
+}
+
+/// Whether this build was compiled with QNN bindings (`QNN_SDK_ROOT` set).
+pub const fn qnn_compiled() -> bool {
+    cfg!(qnn_sdk)
+}
 
 /// Returned when Hexagon NPU dispatch is unavailable and the caller should fall
 /// back to CPU.
@@ -46,10 +141,98 @@ pub fn matmul(lhs: &QnnFloatTensor, rhs: &QnnFloatTensor) -> QnnFloatTensor {
     #[cfg(qnn_sdk)]
     {
         if let Ok(result) = qnn::qnn_matmul(lhs, rhs) {
+            NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
             return result;
         }
     }
     cpu_matmul(lhs, rhs)
+}
+
+/// Try a conv2d on the NPU. `None` means the caller should use the CPU path.
+#[cfg(qnn_sdk)]
+pub fn try_conv2d(
+    x: &QnnFloatTensor,
+    weight: &QnnFloatTensor,
+    bias: Option<&QnnFloatTensor>,
+    stride: [usize; 2],
+    padding: [usize; 2],
+    dilation: [usize; 2],
+    groups: usize,
+) -> Option<QnnFloatTensor> {
+    if !npu_enabled() {
+        return None;
+    }
+    let result = qnn::qnn_conv2d(x, weight, bias, stride, padding, dilation, groups).ok()?;
+    NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    Some(result)
+}
+
+/// Try a 2D pooling on the NPU. `None` means the caller should use the CPU path.
+#[cfg(qnn_sdk)]
+pub fn try_pool2d(
+    x: &QnnFloatTensor,
+    max: bool,
+    kernel: [usize; 2],
+    stride: [usize; 2],
+    padding: [usize; 2],
+    count_include_pad: bool,
+) -> Option<QnnFloatTensor> {
+    if !npu_enabled() {
+        return None;
+    }
+    let result = qnn::qnn_pool2d(x, max, kernel, stride, padding, count_include_pad).ok()?;
+    NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    Some(result)
+}
+
+/// Try a ReLU on the NPU. `None` means the caller should use the CPU path.
+#[cfg(qnn_sdk)]
+pub fn try_relu(x: &QnnFloatTensor) -> Option<QnnFloatTensor> {
+    if !npu_enabled() {
+        return None;
+    }
+    let result = qnn::qnn_relu(x).ok()?;
+    NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    Some(result)
+}
+
+/// Run a whole network as one fused NPU graph. `key` names the graph and must
+/// be the same for every call with the same `graph`. Counts one dispatch per
+/// op in the graph. `None` means CPU.
+pub fn run_fused(key: &'static str, graph: &'static FusedGraph, input: &[f32]) -> Option<Vec<f32>> {
+    #[cfg(qnn_sdk)]
+    {
+        if npu_enabled() {
+            if let Ok(out) = qnn::qnn_fused(key, graph, input) {
+                NPU_DISPATCHES.fetch_add(graph.ops.len() as u64, Ordering::Relaxed);
+                return Some(out);
+            }
+        }
+    }
+    let _ = (key, graph, input);
+    None
+}
+
+/// Try a softmax over the last axis on the NPU. `None` means CPU.
+#[cfg(qnn_sdk)]
+pub fn try_softmax(x: &QnnFloatTensor) -> Option<QnnFloatTensor> {
+    if !npu_enabled() {
+        return None;
+    }
+    let result = qnn::qnn_softmax(x).ok()?;
+    NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    Some(result)
+}
+
+/// Try a concat on the NPU. `None` means the caller should use the CPU path.
+#[cfg(qnn_sdk)]
+pub fn try_concat(tensors: &[&QnnFloatTensor], axis: usize) -> Option<QnnFloatTensor> {
+    if !npu_enabled() {
+        return None;
+    }
+    let result = qnn::qnn_concat(tensors, axis).ok()?;
+    NPU_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+    Some(result)
 }
 
 // ---------------------------------------------------------------------------
@@ -276,6 +459,62 @@ mod tests {
         let rhs = QnnFloatTensor::new(vec![3.0, 4.0, 5.0, 6.0], vec![2, 2]);
         let got = cpu_matmul(&lhs, &rhs);
         assert_eq!(got.data, vec![0.0, 0.0, 13.0, 16.0]);
+    }
+
+    /// Runs each NPU op on a shape large enough to dispatch, and checks it
+    /// against the Flex reference. Ignored by default: it needs a Hexagon.
+    #[cfg(qnn_sdk)]
+    #[test]
+    #[ignore = "needs a Snapdragon device with the HTP"]
+    fn npu_ops_match_cpu_reference() {
+        use burn_flex::Flex;
+        use burn_tensor::{Tensor, TensorData};
+        let dev = Default::default();
+        let to_t = |v: &QnnFloatTensor, shape: &[usize]| -> Tensor<Flex, 4> {
+            Tensor::from_data(TensorData::new(v.data.clone(), shape.to_vec()), &dev)
+        };
+        let before = npu_dispatch_count();
+
+        let x = QnnFloatTensor::new(seeded(1 * 16 * 32 * 32, 7), vec![1, 16, 32, 32]);
+        let w = QnnFloatTensor::new(seeded(32 * 16 * 3 * 3, 8), vec![32, 16, 3, 3]);
+        let b = QnnFloatTensor::new(seeded(32, 9), vec![32]);
+        let got = try_conv2d(&x, &w, Some(&b), [1, 1], [1, 1], [1, 1], 1).expect("conv on NPU");
+        let want = burn_tensor::module::conv2d(
+            to_t(&x, &[1, 16, 32, 32]),
+            to_t(&w, &[32, 16, 3, 3]),
+            Some(Tensor::<Flex, 1>::from_data(
+                TensorData::new(b.data.clone(), vec![32]),
+                &dev,
+            )),
+            burn_tensor::ops::ConvOptions::new([1, 1], [1, 1], [1, 1], 1),
+        );
+        let want_v = want.into_data().convert::<f32>().into_vec::<f32>().unwrap();
+        assert_close("conv2d", &got.data, &want_v);
+
+        let p = try_pool2d(&x, true, [2, 2], [2, 2], [0, 0], false).expect("maxpool on NPU");
+        assert_eq!(p.shape, vec![1, 16, 16, 16]);
+
+        let r = try_relu(&x).expect("relu on NPU");
+        let want_r: Vec<f32> = x.data.iter().map(|v| v.max(0.0)).collect();
+        assert_close("relu", &r.data, &want_r);
+
+        let c = try_concat(&[&x, &x], 1).expect("concat on NPU");
+        assert_eq!(c.shape, vec![1, 32, 32, 32]);
+
+        assert!(
+            npu_dispatch_count() >= before + 4,
+            "NPU counter did not move"
+        );
+    }
+
+    fn assert_close(what: &str, got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len(), "{what} length");
+        let worst = got
+            .iter()
+            .zip(want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-3, "{what} max abs diff {worst}");
     }
 
     #[test]
